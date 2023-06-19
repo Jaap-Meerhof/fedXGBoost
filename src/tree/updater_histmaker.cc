@@ -13,11 +13,13 @@
 #include "../common/quantile.h"
 #include "../common/group_data.h"
 #include "./updater_basemaker-inl.h"
-
+using namespace std;
 namespace xgboost {
 namespace tree {
 
 DMLC_REGISTRY_FILE_TAG(updater_histmaker);
+
+int FL_split;
 
 class HistMaker: public BaseMaker {
  public:
@@ -26,12 +28,16 @@ class HistMaker: public BaseMaker {
               const std::vector<RegTree*> &trees) override {
     // rescale learning rate according to size of trees
     float lr = param_.learning_rate;
+    FL_split = param_.fl_split;
     param_.learning_rate = lr / trees.size();
     // build tree
     for (auto tree : trees) {
       this->Update(gpair->ConstHostVector(), p_fmat, tree);
     }
     param_.learning_rate = lr;
+  }
+  char const* Name() const {
+    return "grow_histmaker";
   }
 
  protected:
@@ -83,7 +89,7 @@ class HistMaker: public BaseMaker {
     // per thread histset
     std::vector<HistSet> hset;
     // initialize the hist set
-    inline void Init(const TrainParam &param, int nthread) {
+    inline void Configure(const TrainParam &param, int nthread) {
       hset.resize(nthread);
       // cleanup statistics
       for (int tid = 0; tid < nthread; ++tid) {
@@ -91,16 +97,6 @@ class HistMaker: public BaseMaker {
         hset[tid].rptr = dmlc::BeginPtr(rptr);
         hset[tid].cut = dmlc::BeginPtr(cut);
         hset[tid].data.resize(cut.size(), GradStats());
-      }
-    }
-    // aggregate all statistics to hset[0]
-    inline void Aggregate() {
-      bst_omp_uint nsize = static_cast<bst_omp_uint>(cut.size());
-      #pragma omp parallel for schedule(static)
-      for (bst_omp_uint i = 0; i < nsize; ++i) {
-        for (size_t tid = 1; tid < hset.size(); ++tid) {
-          hset[0].data[i].Add(hset[tid].data[i]);
-        }
       }
     }
     /*! \brief clear the workspace */
@@ -274,6 +270,9 @@ class HistMaker: public BaseMaker {
 class CQHistMaker: public HistMaker {
  public:
   CQHistMaker()  = default;
+  char const* Name() const {
+    return "grow_local_histmaker";
+  }
 
  protected:
   struct HistEntry {
@@ -287,10 +286,18 @@ class CQHistMaker: public HistMaker {
                     const std::vector<GradientPair> &gpair,
                     const MetaInfo &info,
                     const bst_uint ridx) {
-      while (istart < hist.size && !(fv < hist.cut[istart])) ++istart;
+      if (FL_split == 0 ){
+        while (istart < hist.size && !(fv < hist.cut[istart])) ++istart;
+      } else {
+        if (fv >= FL_split ){
+            istart = 0;
+        }else {
+          while (istart < hist.size && !(fv < hist.cut[istart])) ++istart;
+        }
+      }
       CHECK_NE(istart, hist.size);
       hist.data[istart].Add(gpair[ridx]);
-    }
+      }
     /*!
      * \brief add a histogram to data,
      * do linear scan, start from istart
@@ -300,7 +307,15 @@ class CQHistMaker: public HistMaker {
       if (fv < hist.cut[istart]) {
         hist.data[istart].Add(gstats);
       } else {
-        while (istart < hist.size && !(fv < hist.cut[istart])) ++istart;
+        if (FL_split == 0){
+          while (istart < hist.size && !(fv < hist.cut[istart])) ++istart;
+        } else {
+          if (fv >= FL_split ){
+            istart = 0;
+          }else {
+            while (istart < hist.size && !(fv < hist.cut[istart])) ++istart;
+          }
+        }
         if (istart != hist.size) {
           hist.data[istart].Add(gstats);
         } else {
@@ -339,13 +354,13 @@ class CQHistMaker: public HistMaker {
       feat2workindex_[fset[i]] = static_cast<int>(i);
     }
     // start to work
-    this->wspace_.Init(this->param_, 1);
+    this->wspace_.Configure(this->param_, 1);
     // if it is C++11, use lazy evaluation for Allreduce,
     // to gain speedup in recovery
     auto lazy_get_hist = [&]() {
       thread_hist_.resize(omp_get_max_threads());
       // start accumulating statistics
-      for (const auto &batch : p_fmat->GetSortedColumnBatches()) {
+      for (const auto &batch : p_fmat->GetSortedColumnBatches() ) {//GetBatches<SortedCSCPage>()
         // start enumeration
         const auto nsize = static_cast<bst_omp_uint>(fset.size());
 #pragma omp parallel for schedule(dynamic, 1)
@@ -456,19 +471,34 @@ class CQHistMaker: public HistMaker {
         int offset = feat2workindex_[i];
         if (offset >= 0) {
           const WXQSketch::Summary &a = summary_array_[wid * work_set_size + offset];
-          for (size_t i = 1; i < a.size; ++i) {
-            bst_float cpt = a.data[i].value - kRtEps;
-            if (i == 1 || cpt > this->wspace_.cut.back()) {
-              this->wspace_.cut.push_back(cpt);
+
+          // To see whether using federated mode
+          if (FL_split == 0){
+            // below is original way
+            for (size_t i = 1; i < a.size; ++i) {
+              bst_float cpt = a.data[i].value - kRtEps;
+              if (i == 1 || cpt > this->wspace_.cut.back()) {
+                this->wspace_.cut.push_back(cpt);
+              }
+            }
+            // push a value that is greater than anything
+            if (a.size != 0) {
+              bst_float cpt = a.data[a.size - 1].value;
+              // this must be bigger than last value in a scale
+              bst_float last = cpt + fabs(cpt) + kRtEps;
+              this->wspace_.cut.push_back(last);
+            }
+
+            // below is federated way, to set federated set
+          } else {
+            for (size_t i = 1; i < (FL_split+1); ++i) {
+              bst_float cpt = i ;
+              if (i == 1 || cpt > this->wspace_.cut.back()) {
+                this->wspace_.cut.push_back(cpt);
+              }
             }
           }
-          // push a value that is greater than anything
-          if (a.size != 0) {
-            bst_float cpt = a.data[a.size - 1].value;
-            // this must be bigger than last value in a scale
-            bst_float last = cpt + fabs(cpt) + kRtEps;
-            this->wspace_.cut.push_back(last);
-          }
+          
           this->wspace_.rptr.push_back(static_cast<unsigned>(this->wspace_.cut.size()));
         } else {
           CHECK_EQ(offset, -2);
@@ -501,7 +531,7 @@ class CQHistMaker: public HistMaker {
       hbuilder[nid].istart = 0;
       hbuilder[nid].hist = this->wspace_.hset[0][fid_offset + wid * (fset.size()+1)];
     }
-    if (this->param_.cache_opt != 0) {
+    if (this->param_.cache_opt !=0  ) {   
       constexpr bst_uint kBuffer = 32;
       bst_uint align_length = col.size() / kBuffer * kBuffer;
       int buf_position[kBuffer];
@@ -637,6 +667,11 @@ class CQHistMaker: public HistMaker {
 
 // global proposal
 class GlobalProposalHistMaker: public CQHistMaker {
+ public:
+  char const* Name() const {
+    return "grow_histmaker";
+  }
+
  protected:
   void ResetPosAndPropose(const std::vector<GradientPair> &gpair,
                           DMatrix *p_fmat,
@@ -682,7 +717,7 @@ class GlobalProposalHistMaker: public CQHistMaker {
       this->feat2workindex_[fset[i]] = static_cast<int>(i);
     }
     // start to work
-    this->wspace_.Init(this->param_, 1);
+    this->wspace_.Configure(this->param_, 1);
     // to gain speedup in recovery
     {
       this->thread_hist_.resize(omp_get_max_threads());
@@ -696,7 +731,7 @@ class GlobalProposalHistMaker: public CQHistMaker {
           std::unique(this->work_set_.begin(), this->work_set_.end()) - this->work_set_.begin());
 
       // start accumulating statistics
-      for (const auto &batch : p_fmat->GetSortedColumnBatches()) {
+      for (const auto &batch : p_fmat->GetSortedColumnBatches() ) {
         // TWOPASS: use the real set + split set in the column iteration.
         this->CorrectNonDefaultPositionByBatch(batch, this->fsplit_set_, tree);
 
@@ -737,12 +772,6 @@ XGBOOST_REGISTER_TREE_UPDATER(LocalHistMaker, "grow_local_histmaker")
 .describe("Tree constructor that uses approximate histogram construction.")
 .set_body([]() {
     return new CQHistMaker();
-  });
-
-XGBOOST_REGISTER_TREE_UPDATER(GlobalHistMaker, "grow_global_histmaker")
-.describe("Tree constructor that uses approximate global proposal of histogram construction.")
-.set_body([]() {
-    return new GlobalProposalHistMaker();
   });
 
 XGBOOST_REGISTER_TREE_UPDATER(HistMaker, "grow_histmaker")
